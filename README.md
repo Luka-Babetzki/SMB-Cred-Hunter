@@ -1,1 +1,1 @@
-# SMB-CredHunter
+# SMB CredHunter
