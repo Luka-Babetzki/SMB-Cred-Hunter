@@ -1,14 +1,14 @@
 #! /usr/bin/env python3
 """
-SMB CredHunter
+SMB Cred Hunter
 +------------+
 A tool for discovering hard-coded credentials across SMB network file shares.
 Built for authorised penetration testing engagements only.
 
 Usage:
-    python smb_credhunter.py -t 192.168.1.0/24
-    python smb_credhunter.py -t 192.168.1.10 -u admin -p password123
-    python smb_credhunter.py -t targets.txt --output results.json
+    python smb_cred_hunter.py -t 192.168.1.0/24
+    python smb_cred_hunter.py -t 192.168.1.10 -u admin -p password123
+    python smb_cred_hunter.py -t targets.txt --output results.json
 """
 
 # ===============================================
@@ -21,19 +21,21 @@ import argparse
 import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+
 from impacket.smbconnection import SMBConnection # Windows Defender blocks install of dependencies, try running in WSL or live USB linux distro on boot.
+from prettytable import PrettyTable
 
 # ===============================================
 # CONSTANTS
 # ===============================================
 
 BANNER = r"""
-  ███████╗███╗   ███╗██████╗      ██████╗██████╗ ███████╗██████╗ ██╗  ██╗██╗   ██╗███╗   ██╗████████╗███████╗██████╗
-  ██╔════╝████╗ ████║██╔══██╗    ██╔════╝██╔══██╗██╔════╝██╔══██╗██║  ██║██║   ██║████╗  ██║╚══██╔══╝██╔════╝██╔══██╗
-  ███████╗██╔████╔██║██████╔╝    ██║     ██████╔╝█████╗  ██║  ██║███████║██║   ██║██╔██╗ ██║   ██║   █████╗  ██████╔╝
-  ╚════██║██║╚██╔╝██║██╔══██╗    ██║     ██╔══██╗██╔══╝  ██║  ██║██╔══██║██║   ██║██║╚██╗██║   ██║   ██╔══╝  ██╔══██╗
-  ███████║██║ ╚═╝ ██║██████╔╝    ╚██████╗██║  ██║███████╗██████╔╝██║  ██║╚██████╔╝██║ ╚████║   ██║   ███████╗██║  ██║
-  ╚══════╝╚═╝     ╚═╝╚═════╝      ╚═════╝╚═╝  ╚═╝╚══════╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
+  ███████╗███╗   ███╗██████╗      ██████╗██████╗ ███████╗██████╗     ██╗  ██╗██╗   ██╗███╗   ██╗████████╗███████╗██████╗
+  ██╔════╝████╗ ████║██╔══██╗    ██╔════╝██╔══██╗██╔════╝██╔══██╗    ██║  ██║██║   ██║████╗  ██║╚══██╔══╝██╔════╝██╔══██╗
+  ███████╗██╔████╔██║██████╔╝    ██║     ██████╔╝█████╗  ██║  ██║    ███████║██║   ██║██╔██╗ ██║   ██║   █████╗  ██████╔╝
+  ╚════██║██║╚██╔╝██║██╔══██╗    ██║     ██╔══██╗██╔══╝  ██║  ██║    ██╔══██║██║   ██║██║╚██╗██║   ██║   ██╔══╝  ██╔══██╗
+  ███████║██║ ╚═╝ ██║██████╔╝    ╚██████╗██║  ██║███████╗██████╔╝    ██║  ██║╚██████╔╝██║ ╚████║   ██║   ███████╗██║  ██║
+  ╚══════╝╚═╝     ╚═╝╚═════╝      ╚═════╝╚═╝  ╚═╝╚══════╝╚═════╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
   SMB Share Credential Hunter | For authorised use only | By adver5e
 """
 
@@ -212,14 +214,92 @@ def _smb_connect(host, port, timeout):
 # PHASE 4: SHARE SELECTION (prettytable)
 # ===============================================
 
+def prompt_share_selection(accessible_shares, inaccessible_shares):
+    """
+    ...
+    """
+    rows = []
+    idx = 1
 
+    # ...
+    for host, data in accessible_shares.items():
+        port = data["port"]
+        for share in data ["shares"]:
+            rows.append({
+                "idx": idx,
+                "host": host,
+                "port": port,
+                "share": share["name"],
+                "remark": share["remark"],
+                "status": "accessible"
+            })
+            idx += 1
+    
+    # ...
+    for host, shares in inaccessible_shares.items():
+        for share_name in shares:
+            rows.append({
+                "idx": "-",
+                "host": host,
+                "port": "-",
+                "share": share_name,
+                "remark": "-",
+                "status": "denied"
+            })
 
+    # ...
+    table = PrettyTable()
+    table.field_names = ["#", "Host", "Port", "Share", "Remark", "Status"]
+    table.align["Share"] = "1"
+    table.align["Remark"] = "1"
 
+    for row in rows:
+        status = "[+] accessible" if row["status"] == "accessible" else "[-] denied"
+        table.add_row([
+            row["idx"], row["host"], row["port"],
+            row["share"], row["remark"], status
+        ])
 
+    print("\n[*] Discovered shares:\n")
+    print(table)
 
+    selectable = [r for r in rows if r["status"] == "accessible"]
+    if not selectable:
+        return []
 
+    print("\n Enter share numbers to hunt, comma separated (e.g. 1,3)")
+    print(" Or 'all' to hunt every accessible share")
+    print(" Or 'q' to quit")
 
+    while True:
+        try:
+            raw = input("\n > ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return[]
 
+        if raw in ("", "q", "quit"):
+            return []
+        
+        if raw == "all":
+            return [(r["host"], r["port"], r["share"]) for r in selectable]
+
+        try:
+            chosen = {int(x.strip()) for x in raw.split(",")}
+        except ValueError:
+            print(" [!] Enter numbers, 'all', or 'q'")
+            continue
+
+        valid = {r["idx"] for r in selectable}
+        invalid = chosen - valid
+        if invalid:
+            print(f" [!] Invalid share number(s): {sorted(invalid)}")
+            continue
+
+        return [
+            (r["host"], r["port"], r["share"])
+            for r in selectable if r["idx"] in chosen
+        ]
 
 
 # ===============================================
@@ -299,7 +379,8 @@ def main():
         print("[-] No valid targets parsed. Existing...")
         return
     
-#    print(f"[*] Loaded {len(targets)} targets(s): {targets}")
+    ports = [int(p.strip()) for p in args.port.split(",")]
+    print(f"[*] Loaded {len(targets)} targets(s) | Ports: {ports}")
 
     # --- Phase 2: Scan for open SMB ports ---
     print(f"\n[*] Scanning for open SMB ports...")
@@ -333,6 +414,15 @@ def main():
     if not accessible_shares:
         print("[-] No accessible shares found. Exiting...")
         return
+
+    # --- Phase 4: ...
+    selected = prompt_share_selection(accessible_shares, inaccessible_shares)
+
+    if not selected:
+        print("[!] No shares selected. Exiting")
+        return
+
+    
 
 
 
