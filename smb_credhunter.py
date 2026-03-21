@@ -15,15 +15,13 @@ Usage:
 # IMPORTS
 # ===============================================
 
-from typing import Any
-
-
 import os
 import ipaddress
 import argparse
 import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Thread
+from typing import Any
+from impacket.smbconnection import SMBConnection # Windows Defender blocks install of dependencies, try running in WSL or live USB linux distro on boot.
 
 # ===============================================
 # CONSTANTS
@@ -39,7 +37,8 @@ BANNER = r"""
   SMB Share Credential Hunter | For authorised use only | By adver5e
 """
 
-
+# Default shares to skip?
+SKIP_SHARES = {"IPC$", "ADMIN$", "print$"}
 
 
 
@@ -55,7 +54,11 @@ BANNER = r"""
 # ===============================================
 
 def parse_targets(target_input):
-    """..."""
+    """
+    Turns target string or file path into flat list of IP strings.
+    Accepts single IP, CIDR range, or path to targets file.
+    Returns hosts
+    """
     hosts = []
 
     if os.path.isfile(target_input):
@@ -70,7 +73,10 @@ def parse_targets(target_input):
 
 
 def _expand_target(target):
-    """..."""
+    """
+    Expand a single IP or CIDR string into an IP list of strings.
+    "192.168.1.0/24 becomes ["192.168.1.1", "192.168.1.2", ...]"
+    """
     try:
         network = ipaddress.ip_network(target, strict=False) # strict=False → 192.168.1.10/24 gets treated as 192.168.1.0/24 to prevent an error.
         return [str(ip) for ip in network.hosts()]
@@ -82,9 +88,13 @@ def _expand_target(target):
 # ===============================================
 
 def scan_smb_ports(hosts, ports, timeout=3, threads=10):
-    """..."""
+    """
+    Scan list of hosts for open SMB ports with raw TCP connect.
+    Prefers port 445 over 139 if both are open one same host.
+    Returns list of (host, port) tuples for hosts with SMB open.
+    """
     tasks = [(host, port) for host in hosts for port in ports]
-    open_hosts = {} #
+    open_hosts = {} # Host + preferred open port
 
     with ThreadPoolExecutor(max_workers=threads) as executor:
         futures = {
@@ -98,11 +108,14 @@ def scan_smb_ports(hosts, ports, timeout=3, threads=10):
                 if exisiting is None or (port == 445 and exisiting != 445):
                     open_hosts[host] = port
 
-    return list(open_hosts.items())
+    return list[tuple](open_hosts.items())
 
 
 def _check_port(host, port, timeout):
-    """..."""
+    """
+    Attempt full TCP connect to host:port.
+    connect_ex() returns 0 for success, error code for fail.
+    """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
@@ -116,13 +129,84 @@ def _check_port(host, port, timeout):
 # PHASE 3: SMB CONNECTION & SHARE ENUMERATION
 # ===============================================
 
+def enumerate_shares(host, port, username="", password="", domain="", timeout=3):
+    """
+    Connect to a host, authenticate & enumeration available shares. 
+    Authenticates in this order: null session, guest, supplied creds.
+    Returns two lists:
+    - accessible: shares that can mount (tree connect succeeded)
+    - inaccessible: shares that are visible but cannot mount (access denied)
+    """
+    conn = _smb_connect(host, port, timeout)
+    if conn is None:
+        return [], []
+
+    # Attempt authentication on shares
+    auth_strategies = [("", ""), ("guest", "")]
+    if username:
+        auth_strategies.append((username, password))
+
+    authed = False
+    for user, pwd in auth_strategies:
+        try:
+            conn.login(user, pwd, domain)
+            authed = True
+            break
+        except Exception:
+            pass
+
+    if not authed:
+        return [], []
+
+    # List all exposed shares
+    try:
+        raw_shares = conn.listShares()
+    except Exception:
+        return [], []
+    
+    all_shares = []
+    for share in raw_shares:
+        # When handling Windows protocols (like SMB) strings are terminated by zero byte: \x00 (null terminator)
+        # [:-1] slices off invisible null terminator so string share names can be compared without failing
+        name = share["shi1_netname"][:-1]
+        remark = share["shi1_remark"][:-1]
+        # Bitmask:
+            # share_type
+                # 00 = disk share
+                # 01 = printer
+                # 10 = device
+                # 11 = IPC
+        # 1000 = hidden (ends with $)
+        # 0001 = visible
+        # mask is 0x3 = 0011
+        share_type = share["shi1_type"]
+        is_disk = (share_type & 0x3) == 0
+
+        if name not in SKIP_SHARES and is_disk:
+            all_shares.append({"name": name, "remark": remark or "-"})
+    
+    accessible = []
+    inaccessible = []
+
+    for share in all_shares:
+        try:
+            conn.connectTree(share["name"])
+            accessible.append(share)
+        except Exception:
+            inaccessible.append(share["name"])
+
+    return accessible, inaccessible
 
 
-
-
-
-
-
+def _smb_connect(host, port, timeout):
+    """
+    Establish a raw SMBConnection without authentication.
+    TCP + SMB dialect negotiation.
+    """
+    try:
+        return SMBConnection(host, host, sess_port=port, timeout=timeout)
+    except Exception:
+        return None
 
 # ===============================================
 # PHASE 4: SHARE SELECTION (prettytable)
@@ -183,7 +267,15 @@ def parse_args():
         help = "Connection timeout in seconrds (default: 3)")
     parser.add_argument("--threads", type=int, default=10,
         help = "Concurrent scan threads (default: 10)")
+    parser.add_argument("-u", "--username", default="",
+        help="SMB username (default: null session)")
+    parser.add_argument("-p", "--password", default="",
+        help="SMB password")
+    parser.add_argument("--domain", default="",
+        help="SMB domain")
+    
     return parser.parse_args()
+    
     
 
 
@@ -218,6 +310,29 @@ def main():
         return
     
     print(f"[+] SMB detected on {len(live_hosts)} hosts(s)") # SUCCESS when running against one target. When running against full network, very slow!!
+
+    # --- Phase 3: Enumerate shares ---
+    print(f"\n[*] Enumerating shares...")
+    accessible_shares = {}
+    inaccessible_shares = {}
+
+    for host, port in live_hosts:
+        print(f"[*] Connecting to {host}:{port}...")
+        accessible, inaccessible = enumerate_shares(
+            host, port,
+            username=args.username,
+            password=args.password,
+            domain=args.domain,
+            timeout=args.timeout
+        )
+        if accessible:
+            accessible_shares[host] = {"port": port, "shares": accessible}
+        if inaccessible:
+            inaccessible_shares[host] = inaccessible
+    
+    if not accessible_shares:
+        print("[-] No accessible shares found. Exiting...")
+        return
 
 
 
