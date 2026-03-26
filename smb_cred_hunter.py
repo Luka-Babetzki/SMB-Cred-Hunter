@@ -1,7 +1,7 @@
 #! /usr/bin/env python3
 """
 SMB Cred Hunter
-+------------+
++-------------+
 A tool for discovering hard-coded credentials across SMB network file shares.
 Built for authorised penetration testing engagements only.
 
@@ -19,11 +19,15 @@ import os
 import ipaddress
 import argparse
 import socket
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+import io
+import re
+import logging
 
-from impacket.smbconnection import SMBConnection # Windows Defender blocks install of dependencies, try running in WSL or live USB linux distro on boot.
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from impacket.smbconnection import SMBConnection # //TODO: Install dependencies using WSL or Linux live usb boot
 from prettytable import PrettyTable
+
+logging.getLogger("impacket").setLevel(logging.CRITICAL) # Suppress impacket's internal logging
 
 # ===============================================
 # CONSTANTS
@@ -36,19 +40,182 @@ BANNER = r"""
   ╚════██║██║╚██╔╝██║██╔══██╗    ██║     ██╔══██╗██╔══╝  ██║  ██║    ██╔══██║██║   ██║██║╚██╗██║   ██║   ██╔══╝  ██╔══██╗
   ███████║██║ ╚═╝ ██║██████╔╝    ╚██████╗██║  ██║███████╗██████╔╝    ██║  ██║╚██████╔╝██║ ╚████║   ██║   ███████╗██║  ██║
   ╚══════╝╚═╝     ╚═╝╚═════╝      ╚═════╝╚═╝  ╚═╝╚══════╝╚═════╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
-  SMB Share Credential Hunter | For authorised use only | By adver5e
+  SMB Share Credential Hunter | For authorised use only | By teard0wn
 """
 
-# Default shares to skip?
+# Default shares to skip
 SKIP_SHARES = {"IPC$", "ADMIN$", "print$"}
 
+# The max file tree depth the file traversal will go
+MAX_DEPTH = 8
 
+# Sources: MANSPIDER, Snaffler DefaultRules.
+INTERESTING_EXTENSIONS = {
+    # Environment & config
+    ".env", ".cfg", ".conf", ".config", ".ini", ".toml",
+    ".xml", ".yaml", ".yml", ".json", ".properties",
 
+    # Infrastructure as code
+    ".tf", ".tfvars",
 
+    # Windows scripting
+    ".ps1", ".psm1", ".psd1",   # PowerShell
+    ".bat", ".cmd", ".vbs",     # batch / VBScript
 
+    # General scripting
+    ".sh", ".py", ".rb", ".pl",
 
+    # Web app config
+    ".php", ".asp", ".aspx",
 
+    # Certificates & keys
+    ".pem", ".key", ".ppk",             # private keys / PuTTY
+    ".pfx", ".p12", ".pkcs12",          # cert bundles with private keys
+    ".jks", ".keystore",                # Java keystores
+    ".der", ".crt", ".cer",             # certificates
 
+    # Password manager databases
+    ".kdbx", ".kdb",                    # KeePass
+    ".psafe3",                          # Password Safe
+    ".agilekeychain", ".opvault",       # 1Password
+
+    # Backups & exports
+    ".bak", ".backup", ".old", ".sql", ".dump",
+
+    # Registry exports
+    ".reg",
+
+    # RDP shortcut files (often store hostnames/usernames, sometimes passwords)
+    ".rdp",
+
+    # CI/CD pipeline files
+    ".travis.yml",
+
+    # Office / data files
+    ".xlsx", ".xls", ".csv", ".docx", ".doc",
+
+    # Misc text
+    ".txt", ".log", ".md",
+}
+
+INTERESTING_FILENAMES = {
+    # Web app config
+    "web.config", "wp-config.php", "appsettings.json", "secrets.json",
+    "config.php", "LocalSettings.php", "settings.py",
+    "application.properties", "database.yml",
+
+    # Containers & infrastructure
+    "docker-compose.yml", "docker-compose.yaml", "dockerfile",
+    "terraform.tfvars", ".env",
+
+    # SSH keys
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+    "id_rsa.pub",   # reveals username/hostname even without the private key
+
+    # AWS CLI credentials file
+    "credentials",
+
+    # Git credential storage
+    ".git-credentials",
+
+    # Package manager auth tokens (contain registry passwords/API keys)
+    ".npmrc", ".pypirc",
+
+    # CI/CD
+    "jenkinsfile", ".travis.yml", ".gitlab-ci.yml",
+
+    # Windows unattended install files
+    "unattend.xml", "unattended.xml", "sysprep.xml", "sysprep.inf",
+
+    # Group Policy Preferences — GPP credential vulnerability (MS14-025)
+    "groups.xml", "scheduledtasks.xml", "services.xml", "datasources.xml",
+
+    # Active Directory database
+    "ntds.dit",
+
+    # Windows credential hive pair
+    "sam", "system",
+
+    # Network device configs
+    "running-config", "startup-config", "cisco.conf",
+
+    # Unix credential files
+    "passwd", "shadow", "master.passwd",
+
+    # Web server auth
+    ".htpasswd",
+}
+
+# Regex patterns that suggest a credential is present.
+# Each tuple: (human-readable label, compiled regex)
+# Ordered roughly by signal quality, with high confidence patterns first.
+CREDENTIAL_PATTERNS = [
+    # Private key headers
+    ("Private key",
+     re.compile(r'-----BEGIN .{0,10}PRIVATE KEY-----')),
+
+    # AWS access key ID
+    ("AWS access key ID",
+     re.compile(r'(?<![A-Z0-9])(AKIA|ABIA|ACCA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])')),
+
+    # AWS secret access key
+    ("AWS secret key",
+     re.compile(r'(?i)aws.{0,20}secret.{0,20}[=:]\s*["\']?([A-Za-z0-9/+]{40})["\']?')),
+
+    # Generic password assignment
+    ("Password assignment",
+     re.compile(r'(?i)(password|passwd|pwd|pass)\s*[=:]\s*["\']?([^\s"\'<>{}\[\]\n]{4,})["\']?')),
+
+    # Generic secret/token assignment
+    ("Secret / token",
+     re.compile(r'(?i)(secret|token|api_key|apikey|api_token|auth_token|access_token)\s*[=:]\s*["\']?([^\s"\'<>{}\[\]\n]{8,})["\']?')),
+
+    # Generic username assignment
+    ("Username assignment",
+     re.compile(r'(?i)(username|user|uid|login|account)\s*[=:]\s*["\']?([^\s"\'<>{}\[\]\n]{3,})["\']?')),
+
+    # Database connection URLs
+    ("Database URL",
+     re.compile(r'(?i)(mysql|postgresql|postgres|mongodb|redis|mssql|oracle):\/\/[^:]+:[^@\s]+@')),
+
+    # .NET / Windows connection strings
+    ("Connection string",
+     re.compile(r'(?i)(Data Source|Initial Catalog|User Id|Password)\s*=')),
+
+    # SMTP credentials
+    ("SMTP credential",
+     re.compile(r'(?i)(smtp.{0,10}(user|pass|password|login)|mail.{0,10}password)\s*[=:]\s*["\']?([^\s"\'<>\n]{4,})["\']?')),
+
+    # PowerShell credential objects and net use commands
+    ("PowerShell credential",
+     re.compile(r'(?i)(ConvertTo-SecureString|net use .+ /user:.+)')),
+
+    # GPP encrypted password field
+    # These can be decrypted with gpp-decrypt
+    ("GPP cpassword",
+     re.compile(r'cpassword="([^"]+)"')),
+
+    # NTLM / MD5 hash values
+    ("Hash value",
+     re.compile(r'(?i)(ntlm|lm|md5|sha1)[\s:=]+["\']?([a-fA-F0-9]{32,})["\']?')),
+
+    # Bearer tokens in config (e.g. GitHub Actions, API configs)
+    ("Bearer token",
+     re.compile(r'(?i)bearer\s+[A-Za-z0-9\-._~+/]{20,}')),
+]
+
+# Lines matching any of these are almost certainly not real credentials.
+# Checked before credential patterns. If a line matches here, skip it.
+FALSE_POSITIVES = [
+    re.compile(r'(?i)^\s*#'),                               # shell / Python comments
+    re.compile(r'(?i)^\s*\/\/'),                            # JS / C++ comments
+    re.compile(r'(?i)^\s*<!--'),                            # HTML / XML comments
+    re.compile(r'(?i)^\s*\*'),                              # Javadoc / block comments
+    re.compile(r'(?i)(example|sample|dummy|fake|test|demo)'),
+    re.compile(r'(?i)(placeholder|changeme|your[_-]?(password|key|token|secret))'),
+    re.compile(r'(?i)<PASSWORD>|<SECRET>|<TOKEN>|<API.?KEY>'),
+    re.compile(r'(?i)^\s*(echo|print|log|console\.(log|warn|error))'),  # debug output lines
+]
 
 
 # ===============================================
@@ -172,6 +339,7 @@ def enumerate_shares(host, port, username="", password="", domain="", timeout=3)
         # [:-1] slices off invisible null terminator so string share names can be compared without failing
         name = share["shi1_netname"][:-1]
         remark = share["shi1_remark"][:-1]
+        """ //TODO: Move this theory into blog post
         # Bitmask:
             # share_type
                 # 00 = disk share
@@ -181,6 +349,7 @@ def enumerate_shares(host, port, username="", password="", domain="", timeout=3)
         # 1000 = hidden (ends with $)
         # 0001 = visible
         # mask is 0x3 = 0011
+        """
         share_type = share["shi1_type"]
         is_disk = (share_type & 0x3) == 0
 
@@ -216,12 +385,13 @@ def _smb_connect(host, port, timeout):
 
 def prompt_share_selection(accessible_shares, inaccessible_shares):
     """
-    ...
+    Display all discovered shares in a table, giving the user a choice of which to hunt.
+    Returns a list of tuples (host, port, share_name).
     """
     rows = []
     idx = 1
 
-    # ...
+    # Assign each share a number for selection
     for host, data in accessible_shares.items():
         port = data["port"]
         for share in data ["shares"]:
@@ -235,7 +405,7 @@ def prompt_share_selection(accessible_shares, inaccessible_shares):
             })
             idx += 1
     
-    # ...
+    # Show inaccessible share, but not selectable
     for host, shares in inaccessible_shares.items():
         for share_name in shares:
             rows.append({
@@ -247,7 +417,7 @@ def prompt_share_selection(accessible_shares, inaccessible_shares):
                 "status": "denied"
             })
 
-    # ...
+    # Build + print the table
     table = PrettyTable()
     table.field_names = ["#", "Host", "Port", "Share", "Remark", "Status"]
     table.align["Share"] = "1"
@@ -271,6 +441,7 @@ def prompt_share_selection(accessible_shares, inaccessible_shares):
     print(" Or 'all' to hunt every accessible share")
     print(" Or 'q' to quit")
 
+    # Keep prompting until valid answer is given
     while True:
         try:
             raw = input("\n > ").strip().lower()
@@ -284,12 +455,14 @@ def prompt_share_selection(accessible_shares, inaccessible_shares):
         if raw == "all":
             return [(r["host"], r["port"], r["share"]) for r in selectable]
 
+        # Parse comma separated numbers
         try:
             chosen = {int(x.strip()) for x in raw.split(",")}
         except ValueError:
             print(" [!] Enter numbers, 'all', or 'q'")
             continue
 
+        # Validate against the actual indices
         valid = {r["idx"] for r in selectable}
         invalid = chosen - valid
         if invalid:
@@ -306,15 +479,95 @@ def prompt_share_selection(accessible_shares, inaccessible_shares):
 # PHASE 5: FILE TRAVERSAL & CREDENTIAL HUNTING
 # ===============================================
 
+def hunt_share(conn, share_name, max_file_size_mb=5):
+    """
+    Recursively traverse a share, scanning interesting files for creds.
+    Returns a list of findings dictionaries.
+    """
+    findings = []
+    max_bytes = max_file_size_mb * 1024 * 1024
+    _traverse(conn, share_name, "\\", findings, max_bytes, depth=0)
+    return findings
 
+def _traverse(conn, share_name, path, findings, max_bytes, depth):
+    """
+    Recursively list a directory. For each entry:
+    - If a directory: call ourselves on it (recursion)
+    - If an interesting file within size limit: scan it.
+    - If depth = MAX_DEPTH: stop.
+    """
+    if depth > MAX_DEPTH:
+        return
 
+    try:
+        # "\\*" is the SMB wildcard, lists everything in current directory
+        entries = conn.listPath(share_name, path.rstrip("\\") + "\\*")
+    except Exception:
+        return
 
+    for entry in entries:
+        name = entry.get_longname()
 
+        if name in (".", ".."): # "." is current directory. ".." is parent directory. Skip both, otherwise traversal will loop forever
+            continue
 
+        full_path = path.rstrip("\\") + "\\" + name
 
+        if entry.is_directory():
+            # Recurse into subdirectory, incredment depth counter
+            _traverse(conn, share_name, full_path, findings, max_bytes, depth + 1)
+    
+        else:
+            size = entry.get_filesize()
+            if size <= max_bytes and _is_interesting(name):
+                matches = _scan_file(conn, share_name, full_path)
+                findings.extend(matches)
 
+def _is_interesting(filename):
+    """
+    Return True if file is worth downloading and scanning.
+    """
+    lower = filename.lower()
+    if lower in INTERESTING_FILENAMES:
+        return True
+    for ext in INTERESTING_EXTENSIONS:
+        if lower.endswitch(ext):
+            return True
+    return False
 
+def _scan_file(conn, share_name, file_path):
+    """
+    Download file into memory and scan each line for cred patterns.
+    Never writes to disk, uses BytesIO as in-memory buffer.
+    """
+    buf = io.BytesIO()
+    try:
+        conn.getFile(share_name, file_path, buf.write)
+    except Exception:
+        return []
+    
+    buf.seek(0)
+    try:
+        content = buf.read().decode("utf-8", errors="ignore") # errors="ignore" skips bytes that are not valid UTF-8
+    except Exception:
+        return []
 
+    findings = []
+    for line_num, line in enumerate(content.splitlines(), start=1):
+        if any(fp.search(line) for fp in FALSE_POSITIVES): # Skip lines that are almost certainly false positives
+            continue
+
+        for label, pattern in CREDENTIAL_PATTERNS:
+            if pattern.search(line):
+                findings.append({
+                    "file": file_path,
+                    "line": line_num,
+                    "pattern": label,
+                    "match": line.strip()[:200]
+                })
+                break # One finding per is limit*
+    
+    return findings
 
 
 # ===============================================
@@ -341,7 +594,7 @@ def parse_args():
     )
     parser.add_argument("-t", "--target", required=True,
         help = "Target IP, CIDR range, or path to targets file")
-    parser.add_argument("-ports", nargs="+", type=int, default=[445, 139],
+    parser.add_argument("--ports", default="445,139",
         help = "Ports to scan (default: 445,139)")
     parser.add_argument("--timeout", type=int, default=3,
         help = "Connection timeout in seconrds (default: 3)")
@@ -353,20 +606,16 @@ def parse_args():
         help="SMB password")
     parser.add_argument("--domain", default="",
         help="SMB domain")
-    
+    parser.add_argument("--timeout", type=int, default=3,
+        help="Connection timeout in seconds (default: 3)")
+    parser.add_argument("--max-file-size", type=int, default=5,
+        dest="max_file_size",
+        help="Max file size to inspect in MB (default: 5)")
     return parser.parse_args()
     
-    
 
-
-
-
-
-
-
-
-
-
+# ===============================================
+# MAIN
 # ===============================================
 
 def main():
@@ -415,14 +664,48 @@ def main():
         print("[-] No accessible shares found. Exiting...")
         return
 
-    # --- Phase 4: ...
+    # --- Phase 4: Shares table & selection ---
     selected = prompt_share_selection(accessible_shares, inaccessible_shares)
 
     if not selected:
         print("[!] No shares selected. Exiting")
         return
 
-    
+    # --- Phase 5: Hunt for credentials ---
+    print(f"\n[*] Phase 3: Hunting for credentials...")
+    all_findings = {}
+
+    for host, port, share_name in selected:
+        print(f"[*] Traversing \\\\{host}\\{share_name}...")
+
+        conn = _smb_connect(host, port, args.timeout)
+        if conn is None:
+            print(f"[-] Could not reconnect to {host}")
+            continue
+
+        # Re-authenticate for the hunting connection
+        authed = False 
+        for user, pwd in [(args.username, args.password), ("", "")]:
+            try:
+                conn.login(user, pwd, args.domain)
+                authed = True
+                break
+            except Exception:
+                pass
+        
+        if not authed:
+            print(f"[-] Auth failed for {host}")
+            continue
+
+        findings = hunt_share(conn, share_name, args.max_file_size)
+
+        if findings:
+            print(f"[+] {len(findings)} potential credential(s) found")
+            if host not in all_findings:
+                all_findings[host] = {}
+            all_findings[host][share_name] = findings
+        else:
+            print(f"[~] Nothing interesting found")
 
 
 
